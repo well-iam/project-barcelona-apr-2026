@@ -1,0 +1,7 @@
+pycocotools>=2.0.7
+Pillow>=10.0.0
+matplotlib>=3.8.0
+numpy>=1.24.0
+tqdm>=4.66.0
+ultralytics>=8.3.0
+anthropic>=0.40.0
