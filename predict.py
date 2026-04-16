@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -35,6 +36,7 @@ from utils import (
     load_annotations,
     visualize_scene,
 )
+from ontology import get_group
 
 # ---------------------------------------------------------------------------
 # Label preprocessing -- GROUP THE 27 RAW LABELS
@@ -216,6 +218,7 @@ def _run_detector_on_image(
                 "category_id": category_id,
                 "bbox": [x1, y1, w, h],
                 "score": float(box.conf.item()),
+                "raw_label": label,  # preserve for head vs body distinction
             }
         )
 
@@ -223,7 +226,7 @@ def _run_detector_on_image(
 
 
 def classify_annotation(ann: dict, categories: dict[int, str]) -> str | None:
-    """Map a raw annotation to a decision group.
+    """Map a raw annotation to a decision group via the shared ontology.
 
     Args:
         ann: Annotation dict with ``category_id``.
@@ -234,15 +237,56 @@ def classify_annotation(ann: dict, categories: dict[int, str]) -> str | None:
         ``"safety_marker"``, or ``None`` if unrecognized.
     """
     name = categories.get(ann["category_id"], "")
-    if name in PERSON_LABELS:
+    group = get_group(name)
+    if group == "PERSON_LIKE":
         return "person"
-    if name in VEHICLE_LABELS:
+    if group == "VEHICLE_LIKE":
         return "vehicle"
-    if name in OBSTACLE_LABELS:
+    if group == "OBSTACLE_LIKE":
         return "obstacle"
-    if name in SAFETY_LABELS:
+    if group == "SAFETY_MARKER_LIKE":
         return "safety_marker"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Spatial triage helpers
+# ---------------------------------------------------------------------------
+# Empirically derived from combined train+val spatial analysis (163k annotations):
+#   PERSON_LIKE  p10=0.212, p50=0.567 (rightward bias — robot navigates left)
+#   VEHICLE_LIKE p10=0.102, p90=0.896 (widest spread — size override applies)
+#   OBSTACLE/SAFETY: symmetric, p10≈0.12-0.16, p90≈0.85-0.87
+# Central lane [0.25, 0.75] confirmed — vehicle-area override added separately.
+
+def classify_lane(bbox: List[float], img_w: int) -> str:
+    """Return 'central' if bbox center falls in [0.25, 0.75] of image width."""
+    cx = (bbox[0] + bbox[2] / 2) / img_w if img_w > 0 else 0.5
+    return "central" if 0.25 <= cx <= 0.75 else "peripheral"
+
+
+def compute_relative_area(bbox: List[float], img_w: int, img_h: int) -> float:
+    """Return bbox area as a fraction of total image area."""
+    img_area = img_w * img_h
+    return bbox_area(bbox) / img_area if img_area > 0 else 0.0
+
+
+def calibrate_confidence(
+    raw_conf: float,
+    certainty: str,
+    action: str,
+    hazards: List[str],
+    spatial_flags: Dict[str, bool],
+) -> float:
+    """Post-process Claude's raw confidence using certainty and spatial flags."""
+    if spatial_flags.get("central_person_large") or spatial_flags.get("central_vehicle_large"):
+        return 1.0
+    if certainty == "low":
+        return min(raw_conf, 0.65)
+    if certainty == "medium":
+        return min(raw_conf, 0.82)
+    if action == "CONTINUE" and not hazards:
+        return min(raw_conf, 0.90)
+    return raw_conf
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +299,13 @@ def _build_scene_description(
     image_w: int,
     image_h: int,
 ) -> str:
-    """Build a concise scene description from detections for Claude."""
+    """Build a concise scene description from detections for Claude.
+
+    Each detection includes: label, lane position, area%, height_ratio,
+    and detection confidence — giving Claude both the size/proximity signal
+    (height_ratio, used by the local GT for STOP threshold) and the
+    spatial context it needs to distinguish STOP from SLOW.
+    """
     if not annotations:
         return "No objects detected in scene."
 
@@ -263,71 +313,115 @@ def _build_scene_description(
     counts: Dict[str, int] = {}
     parts = []
     for ann in annotations:
-        label = categories.get(ann["category_id"], "unknown")
-        counts[label] = counts.get(label, 0) + 1
+        # raw_label (e.g. "helmet", "person") is preserved from YOLO;
+        # fall back to grouped category name for GT-annotation path.
+        display_label = ann.get("raw_label") or categories.get(ann["category_id"], "unknown")
+        counts[display_label] = counts.get(display_label, 0) + 1
         bbox = ann["bbox"]
-        cx = bbox[0] + bbox[2] / 2
+        lane = classify_lane(bbox, image_w)
         area_pct = bbox_area(bbox) / img_area * 100 if img_area > 0 else 0.0
-        if cx < image_w * 0.33:
-            pos = "left"
-        elif cx < image_w * 0.67:
-            pos = "center"
-        else:
-            pos = "right"
-        parts.append(f"{label} ({pos}, {area_pct:.1f}% area)")
+        h_ratio = bbox_height_ratio(bbox, image_h)
+        conf = ann.get("score", 1.0)
+        parts.append(
+            f"{display_label} ({lane}, {area_pct:.1f}% area, h={h_ratio:.2f}, conf={conf:.2f})"
+        )
 
     summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
     return f"Detected: {', '.join(parts)}. Total: {summary}."
+
+
+_FALLBACK_CONN  = ("SLOW", 0.55, "medium", [], "Safety default: API connection error.")
+_FALLBACK_PARSE = ("SLOW", 0.55, "medium", [], "Safety default: API response malformed.")
 
 
 def _call_claude_api_decision(
     scene_description: str,
     client: Any,
     timeout_seconds: int,
-) -> Tuple[str, float, str]:
-    """Call Claude API for a navigation decision. Returns (action, confidence, reasoning)."""
+) -> Tuple[str, float, str, str, List[str]]:
+    """Call Claude API for a navigation decision.
+
+    Returns:
+        (action, confidence_raw, certainty, hazards, reasoning)
+        Use calibrate_confidence() on confidence_raw before surfacing it.
+    """
     system_prompt = (
-        "You are a Safety Controller for an industrial autonomous robot.\n"
-        "Before choosing an action, reason through these steps:\n"
-        "1. List each detected object with its position, area%, and confidence.\n"
-        "2. Classify each as 'Immediate Path' (center position) or "
-        "'Background' (left/right, OR area <2%, OR confidence <0.4).\n"
-        "3. Apply rules:\n"
-        "   STOP: only if an Immediate Path object has area >12% AND confidence >=0.4.\n"
-        "   SLOW: any Immediate Path object is small/low-confidence, "
-        "OR Background objects are present near the path.\n"
-        "   CONTINUE: all objects are Background, or none detected.\n"
-        "Background objects and low-confidence detections should bias toward SLOW, not STOP.\n"
-        "After your reasoning, output a single JSON object on the last line:\n"
-        '{"action": "STOP|SLOW|CONTINUE", "confidence": 0.0-1.0, '
-        '"reasoning": "15-30 words naming objects, positions, and decisive factor"}'
+        "You are a robot safety classifier for an industrial autonomous robot.\n"
+        "CRITICAL DATASET CONVENTION — two distinct bbox types in this dataset:\n"
+        "  'helmet', 'hat', 'head' labels = head-level bboxes (GT-scale). "
+        "h>0.25 in ANY lane → STOP.\n"
+        "  'person' label = full-body bbox (~2-3× larger than head bbox for same worker). "
+        "h>0.50 central → STOP. ANY person detected (any size, any lane) → at least SLOW.\n"
+        "  Safety markers (cone, traffic sign, stop sign, traffic light) → always SLOW "
+        "(note: 'stop sign' is a road sign — use SLOW action, not STOP).\n"
+        "  conf<0.4: set certainty=low.\n\n"
+        "Respond ONLY with valid JSON, no preamble:\n"
+        "{\n"
+        '  "action": "STOP" | "SLOW" | "CONTINUE",\n'
+        '  "confidence_raw": 0.0-1.0,\n'
+        '  "certainty": "high" | "medium" | "low",\n'
+        '  "hazards": ["<label> at <lane> (h=<val>)"],\n'
+        '  "reasoning": "<20-50 words referencing label type, h value, and lane>"\n'
+        "}\n\n"
+        "Rules (GT-aligned):\n"
+        "- STOP: head/hat/helmet h>0.25 any lane. Full-body person h>0.50 central.\n"
+        "- SLOW: any person or vehicle detected (any size, any lane). Safety markers present. Wide obstacles.\n"
+        "- CONTINUE: ONLY if no persons, no vehicles, AND no safety markers detected.\n\n"
+        "EXAMPLES:\n"
+        "Scene: person (central, 18.8% area, h=0.43, conf=0.68), "
+        "person (peripheral, 23.3% area, h=0.63, conf=0.74), "
+        "person (peripheral, 12.8% area, h=0.44, conf=0.62). Total: 3 person.\n"
+        '{"action":"SLOW","confidence_raw":0.72,"certainty":"medium",'
+        '"hazards":["person at central (h=0.43)","person at peripheral (h=0.63)","person at peripheral (h=0.44)"],'
+        '"reasoning":"Three persons detected. Central full-body h=0.43 below STOP threshold. '
+        'Any person present → SLOW regardless of position."}\n\n'
+        "Scene: helmet (central, 6.2% area, h=0.28, conf=0.87). Total: 1 helmet.\n"
+        '{"action":"STOP","confidence_raw":0.95,"certainty":"high",'
+        '"hazards":["helmet at central (h=0.28)"],'
+        '"reasoning":"Helmet head-bbox h=0.28 exceeds 0.25 threshold in any lane. '
+        "Worker's head at close range blocking robot path.\"}\n\n"
+        "Scene: cone (peripheral, 1.2% area, h=0.08, conf=0.91), "
+        "Traffic sign (peripheral, 0.8% area, h=0.06, conf=0.85). Total: 1 cone, 1 Traffic sign.\n"
+        '{"action":"SLOW","confidence_raw":0.68,"certainty":"medium",'
+        '"hazards":["cone at peripheral (h=0.08)","Traffic sign at peripheral (h=0.06)"],'
+        '"reasoning":"Safety markers detected. GT rule: any cone/sign/traffic light → SLOW '
+        'regardless of size or position. No persons or vehicles but path not clear."}\n\n'
+        "Scene: person (peripheral, 5.2% area, h=0.13, conf=0.65), "
+        "person (peripheral, 3.1% area, h=0.08, conf=0.51). Total: 2 person.\n"
+        '{"action":"SLOW","confidence_raw":0.65,"certainty":"medium",'
+        '"hazards":["person at peripheral (h=0.13)","person at peripheral (h=0.08)"],'
+        '"reasoning":"Two peripheral persons detected. Any person present → SLOW '
+        "regardless of size or lane. Workers in area, no imminent collision.\"}"
     )
     try:
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=400,
+            max_tokens=300,
             system=system_prompt,
             messages=[{"role": "user", "content": scene_description}],
             timeout=float(timeout_seconds),
         )
         raw = response.content[0].text.strip()
     except Exception:
-        return "SLOW", 0.55, "Safety default: API connection error."
+        return _FALLBACK_CONN
     try:
         import re as _re
-        # Chain-of-thought response: find the last {...} block.
         matches = _re.findall(r"\{[^{}]+\}", raw, _re.DOTALL)
         if not matches:
-            raise ValueError("No JSON object found in response")
+            raise ValueError("No JSON object found")
         parsed = json.loads(matches[-1])
         action = parsed["action"]
         if action not in ("STOP", "SLOW", "CONTINUE"):
             raise ValueError(f"Invalid action: {action}")
-        confidence = max(0.0, min(1.0, float(parsed["confidence"])))
-        reasoning = str(parsed["reasoning"])
-        return action, confidence, reasoning
+        conf_raw   = max(0.0, min(1.0, float(parsed["confidence_raw"])))
+        certainty  = str(parsed.get("certainty", "medium"))
+        if certainty not in ("high", "medium", "low"):
+            certainty = "medium"
+        hazards    = [str(h) for h in parsed.get("hazards", [])]
+        reasoning  = str(parsed["reasoning"])
+        return action, conf_raw, certainty, hazards, reasoning
     except Exception:
-        return "SLOW", 0.55, "Safety default: API response malformed."
+        return _FALLBACK_PARSE
 
 
 # ---------------------------------------------------------------------------
@@ -373,27 +467,93 @@ def make_decision(
             markers.append(ann)
 
     # -----------------------------------------------------------------------
-    # --- HYBRID LOGIC: hard safety switch + optional Claude API ---
+    # --- HYBRID LOGIC: fast path + hard safety switch + Claude API ---
     # -----------------------------------------------------------------------
 
     if claude_config and claude_config["enabled"]:
-        # Hard safety switch: person too close -> immediate STOP, no API call.
-        for ann in persons:
-            if bbox_height_ratio(ann["bbox"], img_h) > 0.35:
-                return (
-                    "STOP", 1.0,
-                    "Emergency stop: Person detected in immediate path.",
+        # Fast path 1: no detections at all — default SLOW (YOLO may miss objects).
+        if not annotations:
+            return ("SLOW", 0.55, "Safety default: no YOLO detections above threshold.")
+
+        # Separate head-level detections (GT-scale h_ratios: helmet/hat/head) from
+        # full-body detections (YOLO-scale, ~2-3× larger than GT head bboxes).
+        # Empirical check confirmed YOLO outputs head bboxes on ~2/3 of images.
+        _HEAD_RAW = {"hat", "helmet", "head"}
+        head_persons = [
+            a for a in persons
+            if a.get("raw_label", "").strip().lower() in _HEAD_RAW
+        ]
+        body_persons = [a for a in persons if a not in head_persons]
+
+        # Build spatial flags once — used by both the hard switch and calibrate_confidence.
+        spatial_flags: Dict[str, bool] = {
+            "central_person_large": any(
+                classify_lane(a["bbox"], img_w) == "central"
+                and (
+                    (a.get("raw_label", "").lower() in _HEAD_RAW
+                     and compute_relative_area(a["bbox"], img_w, img_h) > 0.04)
+                    or compute_relative_area(a["bbox"], img_w, img_h) > 0.10
                 )
-        # Soft path: ask Claude.
+                for a in persons
+            ),
+            "central_vehicle_large": any(
+                classify_lane(a["bbox"], img_w) == "central"
+                and compute_relative_area(a["bbox"], img_w, img_h) > 0.10
+                for a in vehicles
+            ),
+        }
+
+        # Hard switch A: head/helmet bbox in GT-convention scale (h > 0.25 matches GT rule).
+        for ann in head_persons:
+            h = bbox_height_ratio(ann["bbox"], img_h)
+            lbl = ann.get("raw_label", "head")
+            if h > 0.25 and classify_lane(ann["bbox"], img_w) == "central":
+                return (
+                    "STOP", 0.92,
+                    f"{lbl} (head bbox) in central path at h={h:.2f} — imminent collision.",
+                )
+
+        # Hard switch B: full-body bbox fallback (0.60 ≈ 0.25 × mean 2.4× scale factor).
+        # No lane restriction — GT has no lateral restriction for STOP on tall persons;
+        # peripheral body detections with h>0.60 are mostly GT-STOP (annotation h>0.25).
+        for ann in body_persons:
+            h = bbox_height_ratio(ann["bbox"], img_h)
+            if h > 0.60:
+                lane = classify_lane(ann["bbox"], img_w)
+                return (
+                    "STOP", 0.92,
+                    f"Person (full-body) at h={h:.2f} ({lane}) — imminent collision.",
+                )
+
+        # Hard switch: large vehicle regardless of lane (vehicle spread p10=0.102).
+        for ann in vehicles:
+            area = compute_relative_area(ann["bbox"], img_w, img_h)
+            if area > 0.15:
+                lane = classify_lane(ann["bbox"], img_w)
+                return (
+                    "STOP", 0.97,
+                    f"Vehicle occupying {area:.0%} of frame ({lane} lane).",
+                )
+            # Central vehicle at moderate area → hard STOP.
+            if area > 0.10 and classify_lane(ann["bbox"], img_w) == "central":
+                return (
+                    "STOP", 0.95,
+                    f"Vehicle in central path at {area:.0%} area.",
+                )
+
+        # Soft path: Claude for all remaining ambiguous cases.
         if claude_state["calls_made"] < claude_config["max_calls"]:
             scene_desc = _build_scene_description(
                 annotations, categories, img_w, img_h,
             )
             scene_desc = scene_desc[: claude_config["max_input_chars"]]
-            action, confidence, reasoning = _call_claude_api_decision(
+            action, conf_raw, certainty, hazards, reasoning = _call_claude_api_decision(
                 scene_desc, claude_config["client"], claude_config["timeout_seconds"],
             )
             claude_state["calls_made"] += 1
+            confidence = calibrate_confidence(
+                conf_raw, certainty, action, hazards, spatial_flags,
+            )
             return action, confidence, reasoning
         else:
             return "SLOW", 0.55, "Safety default: Claude call budget exhausted."
@@ -554,7 +714,11 @@ def run_predictions(
         sorted_images = sorted_images[:max_images]
         print(f"Limiting run to {len(sorted_images)} images (--max-images {max_images}).")
 
-    for image_id, image_record in sorted_images:
+    total_images = len(sorted_images)
+    _t_start = time.time()
+    _PROGRESS_INTERVAL = 10  # print every N images
+
+    for _i, (image_id, image_record) in enumerate(sorted_images, 1):
         if detector is not None:
             image_path = _resolve_image_path(data_dir, split, image_record["file_name"])
             if not image_path.exists():
@@ -585,6 +749,27 @@ def run_predictions(
             "confidence": round(confidence, 4),
             "reasoning": reasoning,
         })
+
+        if _i % _PROGRESS_INTERVAL == 0 or _i == total_images:
+            _elapsed = time.time() - _t_start
+            _rate = _elapsed / _i  # seconds per image
+            _remaining = _rate * (total_images - _i)
+            _eta_m, _eta_s = divmod(int(_remaining), 60)
+            _eta_h, _eta_m = divmod(_eta_m, 60)
+            _eta_str = (
+                f"{_eta_h}h{_eta_m:02d}m" if _eta_h
+                else f"{_eta_m}m{_eta_s:02d}s"
+            )
+            _claude_calls = claude_state["calls_made"] if claude_state else 0
+            print(
+                f"[{_i:5d}/{total_images}] "
+                f"elapsed={_elapsed/60:.1f}m  "
+                f"{_rate:.2f}s/img  "
+                f"ETA={_eta_str}  "
+                f"Claude={_claude_calls}calls  "
+                f"last={action}",
+                flush=True,
+            )
 
         # Collect detections for scoring (re-emit the annotations we used)
         for ann in anns:
