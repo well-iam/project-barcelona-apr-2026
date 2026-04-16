@@ -1,6 +1,6 @@
 # THEKER 2026 — Robot Navigation Classifier
 
-**Team Barcelona** · THEKER 2026 Hackathon
+**MAR AI DONA** · THEKER 2026 Hackathon
 
 A hybrid object detection + LLM pipeline for real-time robot safety decisions in industrial environments. Given a single image, the system outputs one of three actions: **STOP**, **SLOW**, or **CONTINUE**.
 

@@ -890,7 +890,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--data-dir", type=Path, default=Path("../data"))
     parser.add_argument("--output", type=Path, default=Path("predictions.json"))
-    parser.add_argument("--team-name", type=str, default="your_team")
+    parser.add_argument("--team-name", type=str, default="MAR AI DONA")
     parser.add_argument("--split", type=str, default="test",
                         choices=["train", "val", "test"])
     parser.add_argument(
